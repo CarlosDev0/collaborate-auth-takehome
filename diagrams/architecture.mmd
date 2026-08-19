@@ -1,0 +1,42 @@
+flowchart LR
+    subgraph clients [Clients]
+        Browser[Browser_PKCE]
+        ClientSystem[ClientSystem_API]
+        InternalSvc[InternalService]
+    end
+
+    subgraph authLayer [CollaborateAuthLayer]
+        AuthServer[OAuth2_OIDC_Endpoints]
+        PermEngine[PermissionEngine]
+        TokenSvc[TokenService]
+        RevCache[RevocationCache_Redis]
+    end
+
+    subgraph external [ExternalDependencies]
+        CasewareIdP[CasewareCentralIdP]
+        FirmIdP[FirmFederatedIdP]
+        PermDB[(PermissionDB)]
+    end
+
+    subgraph resources [ResourceAPIs]
+        DocSvc[DocumentService]
+        CommentSvc[CommentsService]
+        FinSvc[FinancialDataAPI]
+    end
+
+    Browser --> AuthServer
+    AuthServer --> CasewareIdP
+    AuthServer --> FirmIdP
+    AuthServer --> TokenSvc
+    ClientSystem --> TokenSvc
+    InternalSvc --> TokenSvc
+
+    TokenSvc --> PermEngine
+    PermEngine --> PermDB
+    PermEngine --> RevCache
+
+    Browser --> DocSvc
+    ClientSystem --> DocSvc
+    InternalSvc --> CommentSvc
+
+    DocSvc -.->|"validates JWT scopes/claims only"| TokenSvc

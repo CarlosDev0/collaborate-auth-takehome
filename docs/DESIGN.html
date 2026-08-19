@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Collaborate Authorization Layer — Design Document</title>
+  <style>
+    body { font-family: Segoe UI, Arial, sans-serif; max-width: 800px; margin: 2rem auto; line-height: 1.5; color: #222; }
+    h1 { font-size: 1.6rem; border-bottom: 2px solid #333; padding-bottom: 0.3rem; }
+    h2 { font-size: 1.25rem; margin-top: 1.5rem; }
+    h3 { font-size: 1.05rem; margin-top: 1rem; }
+    pre { background: #f4f4f4; padding: 0.75rem; font-size: 0.85rem; overflow-x: auto; }
+    table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: 0.9rem; }
+    th, td { border: 1px solid #ccc; padding: 0.4rem 0.6rem; text-align: left; }
+    th { background: #eee; }
+    hr { margin: 1.5rem 0; border: none; border-top: 1px solid #ccc; }
+    ul { padding-left: 1.25rem; }
+  </style>
+</head>
+<body>
+<h1>Collaborate Authorization Layer — Design Document</h1>
+<p><strong>Author:</strong> Carlos Sanchez<br />
+<strong>Context:</strong> Caseware Collaborate — OAuth2/OIDC authorization layer for multi-tenant engagement workspaces.</p>
+<hr />
+<h2>1. High-Level Architecture</h2>
+<p>Collaborate exposes an <strong>Authorization Layer</strong> between clients and downstream resource APIs (Document Service, Comments Service, Financial Data API). The layer does not replace Caseware's central identity provider (IdP) or firm-federated IdPs; it <strong>issues and validates access tokens</strong> enriched with workspace permissions and firm policy.</p>
+<pre>Browser (PKCE) ──► Auth Server ──► Caseware IdP / Firm IdP
+                      │
+                      ▼
+                 Token Service ◄── Permission Engine ◄── Permission DB
+                      │                    │
+                      ▼                    └── Redis (cache + revocation)
+Client System ──► Token Exchange
+Internal Service ──► Token Exchange
+                      │
+                      ▼
+Resource APIs (validate JWT scopes/claims only — no DB access)</pre>
+<h3>Use Case 1: Login (Authorization Code + PKCE)</h3>
+<ul>
+  <li><strong>Firm staff</strong> authenticate against Caseware's central OIDC IdP.</li>
+  <li><strong>External client users</strong> may authenticate via a <strong>firm-federated SAML/OIDC IdP</strong>, scoped to that firm's workspaces.</li>
+  <li>Per-firm <strong>OAuth client configuration</strong> (<code>client_id</code>, redirect URIs, allowed IdP) routes login to the correct upstream provider.</li>
+  <li>After upstream authentication, Collaborate's Token Service <strong>enriches</strong> the session with workspace roles and permission version before issuing access tokens.</li>
+</ul>
+<h3>Use Case 2: Permission Checking (Fast, Revocable)</h3>
+<p>Permissions combine three layers stored in Collaborate's database:</p>
+<table>
+  <tr><th>Layer</th><th>Example</th></tr>
+  <tr><td>Workspace role</td><td>owner / contributor / viewer</td></tr>
+  <tr><td>Resource override</td><td>single document shared with one external user</td></tr>
+  <tr><td>Firm policy</td><td>firm-wide restrictions on external access</td></tr>
+</table>
+<p><strong>Fast path:</strong> Resource APIs validate JWT claims only (<code>scope</code>, <code>workspace_id</code>, <code>perm_version</code>). A Redis cache keyed by <code>(userId, workspaceId, resourceId, permVersion)</code> avoids DB round-trips for repeated checks at token issuance and optional gateway-level enrichment.</p>
+<p><strong>Revocation within seconds:</strong> Each permission change increments a workspace <strong>permission version</strong>. Tokens carry <code>perm_version</code>; Redis publishes invalidation events on DB changes. APIs compare token version against cached current version — mismatch yields 403 without waiting for token expiry. Short access-token TTL (5–15 min) limits stale-allow window for long-lived sessions (e.g., collaborative editing).</p>
+<h3>Use Case 3: On-Behalf-Of Authorization</h3>
+<p>Two delegation paths, both via <strong>RFC 8693 Token Exchange</strong>:</p>
+<ol>
+  <li><strong>Client system → Collaborate API</strong> on behalf of an employee (pull engagement data into internal systems).</li>
+  <li><strong>Internal Collaborate service → Caseware API</strong> on behalf of the user who triggered an action (audit attribution preserved).</li>
+</ol>
+<p><strong>Confused deputy prevention:</strong></p>
+<ul>
+  <li>Validate <strong>actor token</strong> (calling client/service) is a registered integration with <code>token-exchange</code> grant.</li>
+  <li>Issue a <strong>narrower</strong> token: restricted <code>aud</code>, reduced <code>scope</code>, explicit <code>sub</code> (delegated user), <code>act</code>/<code>actor</code> claim for audit.</li>
+  <li>Reject exchanges where requested scope exceeds actor's or subject's effective permissions.</li>
+  <li>Bind tokens to <code>client_id</code> + resource identifiers via <code>authorization_details</code> where applicable.</li>
+</ul>
+<p><strong>Assumption:</strong> Credential storage, MFA, and full IdP implementation are out of scope — upstream IdPs are external dependencies.</p>
+<hr />
+<h2>2. Implementation Plan</h2>
+<table>
+  <tr><th>Phase</th><th>Scope</th><th>Deliverables</th></tr>
+  <tr><td><strong>1 — Token validation contract</strong></td><td>JWT bearer middleware, scope/claim policies per API</td><td>Protected resource endpoints (this exercise, Option A)</td></tr>
+  <tr><td><strong>2 — Login &amp; federation</strong></td><td>OIDC middleware, per-firm client registry, PKCE, federated IdP discovery</td><td>Interactive login flows</td></tr>
+  <tr><td><strong>3 — Permission engine</strong></td><td>DB schema, Redis cache-aside, change-event hooks, token enrichment at issuance</td><td>Sub-second permission checks; version-based revocation</td></tr>
+  <tr><td><strong>4 — On-behalf-of</strong></td><td>Token exchange endpoint, actor validation, structured audit logs</td><td>Delegated tokens with narrowed scope</td></tr>
+</table>
+<p><strong>AWS alignment (Caseware stack):</strong> ALB + API Gateway, ElastiCache Redis, RDS (permissions), CloudWatch metrics/logs, X-Ray tracing.</p>
+<hr />
+<h2>3. Testing Strategy</h2>
+<table>
+  <tr><th>Layer</th><th>Focus</th></tr>
+  <tr><td><strong>Unit</strong></td><td>Scope/claim authorization handlers, cache key construction, token exchange validation rules</td></tr>
+  <tr><td><strong>Integration</strong></td><td><code>WebApplicationFactory</code> with signed JWTs — 200 / 401 / 403 paths</td></tr>
+  <tr><td><strong>Contract</strong></td><td>Resource APIs reject tokens missing required <code>scope</code> or stale <code>perm_version</code></td></tr>
+  <tr><td><strong>Load (design target)</strong></td><td>Cache hit ratio under ~10k authz checks/sec; p99 latency budget &lt; 10 ms at API</td></tr>
+  <tr><td><strong>Security</strong></td><td>Confused-deputy scenarios: mismatched <code>sub</code>, overly broad scope, unregistered actor client</td></tr>
+</table>
+<p>The included code slice implements integration tests for Option A (valid scope, missing token, wrong scope, expired token, wrong audience).</p>
+<hr />
+<h2>4. Evaluation &amp; Observability</h2>
+<p><strong>Metrics:</strong> authz check latency (p50/p99), cache hit rate, token validation failures by reason, revocation propagation lag (time from DB change to cache update).</p>
+<p><strong>Logging:</strong> Structured fields — <code>sub</code>, <code>client_id</code>, <code>workspace_id</code>, decision (allow/deny). No PII or token values in logs.</p>
+<p><strong>Tracing:</strong> Correlate login → token issue → resource access → on-behalf-of exchange in a single trace (X-Ray/OpenTelemetry).</p>
+<p><strong>Alerts:</strong> Spikes in 401/403 rates, cache miss rate above threshold, revocation lag exceeding SLA (target: seconds).</p>
+<hr />
+<h2>5. Failure Modes &amp; Tradeoffs</h2>
+<table>
+  <tr><th>Tradeoff</th><th>Choice</th><th>Risk / Mitigation</th></tr>
+  <tr><td>Cache vs consistency</td><td>Eventual consistency (~seconds) via version + invalidation</td><td>Stale allow → <code>perm_version</code> in token; fail closed on mismatch</td></tr>
+  <tr><td>Token TTL</td><td>Short access tokens (5–15 min)</td><td>More refresh traffic; avoids mass re-auth on revocation</td></tr>
+  <tr><td>Scope granularity</td><td>Resource-type scopes (<code>documents:read</code>) + claims for overrides</td><td>Larger tokens; reference tokens + introspection if needed</td></tr>
+  <tr><td>Framework vs custom crypto</td><td>ASP.NET Core JWT bearer + policy handlers</td><td>Built-in handles signatures, clock skew, JWKS rotation; custom code only for domain rules</td></tr>
+  <tr><td>Redis outage</td><td>Fail closed for external users</td><td>Higher DB load on fallback path; alert and scale read replicas</td></tr>
+</table>
+<p><strong>Option A implementation note:</strong> The code slice uses ASP.NET Core's <code>JwtBearer</code> middleware and a custom <code>ScopeAuthorizationHandler</code> — no hand-rolled cryptography. Production would use asymmetric keys (RS256) from IdP JWKS; the dev slice uses a symmetric key stub.</p>
+<hr />
+<h2>Assumptions</h2>
+<ul>
+  <li>Caseware central IdP exposes OIDC discovery (<code>/.well-known/openid-configuration</code>).</li>
+  <li>Permission DB emits change events (outbox, CDC, or domain events).</li>
+  <li>Redis is available with sub-millisecond latency in-region.</li>
+  <li>Access tokens are JWTs enriched at issuance by Collaborate's Token Service.</li>
+</ul>
+</body>
+</html>
